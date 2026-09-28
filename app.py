@@ -14,7 +14,7 @@ import os
 import glob
 
 # --- Page Configuration ---
-st.set_page_config(page_title="Email Extractor", page_icon="📧", layout="centered")
+st.set_page_config(page_title="Gmail Extractor & Analytic", page_icon="📧", layout="centered")
 
 def get_text_from_email(msg):
     """Safely extracts text content from complex multipart/HTML emails."""
