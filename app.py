@@ -183,7 +183,7 @@ if submitted:
                 fetch_size_bytes = int(fetch_size_kb * 1024)
                 
                 # Fetches 100% of the Header, and dynamically limits ONLY the Body to X kilobytes
-                fetch_command = f"(BODY.PEEK[HEADER] BODY.PEEK[TEXT]<0.{fetch_size_bytes}>)"
+                fetch_command = f"(RFC822.SIZE BODY.PEEK[HEADER] BODY.PEEK[TEXT]<0.{fetch_size_bytes}>)"
 
                 log_container.info(f"Found {total_emails} emails. Starting partial download ({fetch_size_kb}KB limit per email body)...")
 
@@ -195,11 +195,15 @@ if submitted:
                     
                     current_header = b""
                     current_body = b""
+                    current_size_bytes = 0
                     
                     for response_part in msg_data:
                         # Capture the header block and the body block
                         if isinstance(response_part, tuple):
                             descriptor = response_part[0].upper()
+                            size_match = re.search(rb'RFC822\.SIZE\s+(\d+)', descriptor)
+                            if size_match:
+                                current_size_bytes = int(size_match.group(1))
                             if b'HEADER' in descriptor:
                                 current_header = response_part[1]
                             elif b'TEXT' in descriptor:
@@ -248,12 +252,14 @@ if submitted:
                                     "Date": date_str,
                                     "Sender Email": sender_email,
                                     "Email Title": subject,
-                                    "Email Content": body_text
+                                    "Email Content": body_text,
+                                    "Email Size (KB)": current_size_bytes / 1024
                                 })
                                 
                                 # Reset for the next email in the batch
                                 current_header = b""
                                 current_body = b""
+                                current_size_bytes = 0
                     
                     processed_count += len(batch_ids)
                     elapsed_time = time.time() - start_time
@@ -343,20 +349,49 @@ if st.session_state.get('download_ready', False):
             # Create a YYYY-MM column for the histogram
             df['Month'] = df['Date'].dt.strftime('%Y-%m')
             
-            # --- Table: Top 20 Senders ---
-            st.markdown("#### 🏆 Top 20 Email Senders")
-            top_20 = df['Sender Email'].value_counts().head(20).reset_index()
-            top_20.columns = ['Sender Email', 'Total Emails']
+            if 'Email Size (KB)' not in df.columns:
+                df['Email Size (KB)'] = 0
+
+            # --- Table: Top Senders ---
+            st.markdown("#### 🏆 Top Email Senders")
+            top_sender_count = st.number_input(
+                "Number of top email senders",
+                min_value=1,
+                max_value=1000,
+                value=20,
+                step=1,
+                key="top_sender_count"
+            )
+            top_senders = (
+                df.groupby('Sender Email', as_index=False)
+                .agg(**{
+                    'Total Emails': ('Sender Email', 'size'),
+                    'Total Size (KB)': ('Email Size (KB)', 'sum')
+                })
+                .sort_values('Total Emails', ascending=False)
+                .head(top_sender_count)
+            )
+            top_senders['Total Size (KB)'] = top_senders['Total Size (KB)'].apply(
+                lambda size: f"{size:,.0f}"
+            )
+
+            st.dataframe(top_senders, use_container_width=True, hide_index=True)
+
+            # --- Chart: Top Senders by Month ---
+            st.markdown("#### 📊 Top Senders by Month")
+            monthly_sender_count = st.number_input(
+                "Number of top senders by month",
+                min_value=1,
+                max_value=1000,
+                value=10,
+                step=1,
+                key="monthly_sender_count"
+            )
+
+            top_monthly_senders = df['Sender Email'].value_counts().head(monthly_sender_count).index
+            df_top_monthly = df[df['Sender Email'].isin(top_monthly_senders)]
             
-            st.dataframe(top_20, use_container_width=True, hide_index=True)
-            
-            # --- Chart: Histogram of Top 10 by Month ---
-            st.markdown("#### 📊 Top 10 Senders by Month")
-            
-            top_10_senders = df['Sender Email'].value_counts().head(10).index
-            df_top10 = df[df['Sender Email'].isin(top_10_senders)]
-            
-            monthly_counts = df_top10.groupby(['Month', 'Sender Email']).size().reset_index(name='Count')
+            monthly_counts = df_top_monthly.groupby(['Month', 'Sender Email']).size().reset_index(name='Count')
             
             if not monthly_counts.empty:
                 fig = px.bar(
