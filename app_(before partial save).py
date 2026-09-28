@@ -10,8 +10,6 @@ from datetime import datetime, timedelta
 import time
 from zoneinfo import ZoneInfo
 import plotly.express as px
-import os
-import glob
 
 # --- Page Configuration ---
 st.set_page_config(page_title="Email Extractor", page_icon="📧", layout="centered")
@@ -65,30 +63,6 @@ st.info(
     "**Steps:** Log in ➡️ Create a new app name ➡️ Copy the 16-character code ➡️ Paste it below."
 )
 
-# --- Connection Drop Recovery ---
-partial_files = glob.glob("partial_save_*.csv")
-if partial_files:
-    with st.expander("🚨 Recover Disconnected Files (Click to open)", expanded=True):
-        st.warning(
-            "**Did your phone screen turn off?**\n\n"
-            "Mobile devices pause network connections when the screen sleeps, causing Streamlit to reset. "
-            "Fortunately, the server saved your progress! Download your recovered files below:"
-        )
-        # Sort files by modification time (newest first)
-        partial_files.sort(key=os.path.getmtime, reverse=True)
-        for f_name in partial_files:
-            try:
-                with open(f_name, "rb") as file:
-                    st.download_button(
-                        label=f"📥 Download {f_name} ({os.path.getsize(f_name) // 1024} KB)",
-                        data=file,
-                        file_name=f_name,
-                        mime="text/csv",
-                        key=f"recover_{f_name}"
-                    )
-            except Exception as e:
-                st.error(f"Could not read {f_name}: {e}")
-
 # --- Input Form ---
 with st.form("extraction_form"):
     col1, col2 = st.columns(2)
@@ -111,15 +85,6 @@ with st.form("extraction_form"):
     with col6:
         char_limit = st.number_input("Text Character Limit", min_value=10, max_value=10000, value=500, step=100, 
                                      help="The maximum number of characters saved into the CSV per email.")
-
-    # New Partial Save Configuration
-    col7, col8 = st.columns(2)
-    with col7:
-        enable_partial_save = st.checkbox("Enable Partial Save (Local CSV)", value=True, 
-                                          help="Periodically saves data to the local Codespace directory to prevent data loss in case of interruption.")
-    with col8:
-        save_interval = st.number_input("Save Interval (Emails)", min_value=100, max_value=5000, value=500, step=100, 
-                                        help="How often to trigger the partial file save.")
 
     submitted = st.form_submit_button("Start Optimized Extraction", use_container_width=True)
 
@@ -175,13 +140,13 @@ if submitted:
                 email_data = []
                 start_time = time.time()
                 processed_count = 0
-                last_save_count = 0 # Track partial saves
                 
                 batch_size = 100 
                 local_tz = ZoneInfo("Asia/Hong_Kong")
                 
                 fetch_size_bytes = int(fetch_size_kb * 1024)
                 
+                # --- NEW FETCH COMMAND ---
                 # Fetches 100% of the Header, and dynamically limits ONLY the Body to X kilobytes
                 fetch_command = f"(BODY.PEEK[HEADER] BODY.PEEK[TEXT]<0.{fetch_size_bytes}>)"
 
@@ -264,18 +229,9 @@ if submitted:
                     progress_percentage = min(processed_count / total_emails, 1.0)
                     progress_bar.progress(progress_percentage)
                     
-                    # --- NEW PARTIAL SAVE LOGIC ---
-                    partial_msg = ""
-                    if enable_partial_save and (processed_count - last_save_count) >= save_interval:
-                        partial_filename = f"partial_save_{start_date.strftime('%Y%m%d')}_to_{end_date.strftime('%Y%m%d')}.csv"
-                        df_partial = pd.DataFrame(email_data)
-                        df_partial.to_csv(partial_filename, index=False, encoding='utf-8-sig')
-                        last_save_count = processed_count
-                        partial_msg = f"\n\n*(💾 Safely backed up {processed_count} rows to `{partial_filename}` in Codespace)*"
-
                     log_container.info(
                         f"⚡ Processed {processed_count} / {total_emails} emails... "
-                        f"(⏳ Est. remaining time: {est_remaining_sec} seconds){partial_msg}"
+                        f"(⏳ Est. remaining time: {est_remaining_sec} seconds)"
                     )
 
                 mail.logout()
@@ -294,14 +250,6 @@ if submitted:
                 st.session_state['show_analytics'] = False # Reset analytics view on new pull
                 
                 log_container.success(f"✅ Extraction complete in {int(time.time() - start_time)} seconds! File is ready.")
-
-                if enable_partial_save:
-                    try:
-                        cleanup_files = glob.glob(f"partial_save_{start_date.strftime('%Y%m%d')}_to_{end_date.strftime('%Y%m%d')}.csv")
-                        for f_name in cleanup_files:
-                            os.remove(f_name)
-                    except Exception:
-                        pass
 
         except Exception as e:
             st.error(f"Error during extraction: {str(e)}")
