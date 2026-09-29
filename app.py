@@ -12,6 +12,16 @@ from zoneinfo import ZoneInfo
 import plotly.express as px
 import os
 import glob
+import hashlib
+import io
+
+
+def partial_save_filename(email_addr, start_date, end_date, fetch_size_kb, char_limit):
+    account_key = hashlib.sha256(email_addr.strip().lower().encode("utf-8")).hexdigest()[:12]
+    return (
+        f"partial_save_{account_key}_{start_date.strftime('%Y%m%d')}_to_"
+        f"{end_date.strftime('%Y%m%d')}_{fetch_size_kb}kb_{char_limit}chars.csv"
+    )
 
 # --- Page Configuration ---
 st.set_page_config(page_title="Gmail Extractor & Analytic", page_icon="📧", layout="centered")
@@ -55,7 +65,7 @@ def get_text_from_email(msg):
     return text.strip()
 
 # --- UI Header ---
-st.title("📧 Email Extraction Task")
+st.title("📧 Gmail Extractor & Analytic")
 st.markdown("Connect securely to IMAP and extract emails to a Sheet-ready CSV.")
 
 # --- App Password Reminder ---
@@ -79,13 +89,21 @@ if partial_files:
         for f_name in partial_files:
             try:
                 with open(f_name, "rb") as file:
-                    st.download_button(
-                        label=f"📥 Download {f_name} ({os.path.getsize(f_name) // 1024} KB)",
-                        data=file,
-                        file_name=f_name,
-                        mime="text/csv",
-                        key=f"recover_{f_name}"
-                    )
+                    file_data = file.read()
+                try:
+                    recovered_df = pd.read_csv(io.BytesIO(file_data))
+                    if "_IMAP UID" in recovered_df.columns:
+                        recovered_df = recovered_df.drop(columns=["_IMAP UID"])
+                        file_data = recovered_df.to_csv(index=False).encode("utf-8-sig")
+                except Exception:
+                    pass
+                st.download_button(
+                    label=f"📥 Download {f_name} ({os.path.getsize(f_name) // 1024} KB)",
+                    data=file_data,
+                    file_name=f_name,
+                    mime="text/csv",
+                    key=f"recover_{f_name}"
+                )
             except Exception as e:
                 st.error(f"Could not read {f_name}: {e}")
 
@@ -120,6 +138,12 @@ with st.form("extraction_form"):
     with col8:
         save_interval = st.number_input("Save Interval (Emails)", min_value=100, max_value=5000, value=500, step=100, 
                                         help="How often to trigger the partial file save.")
+
+    resume_partial = st.checkbox(
+        "Resume from matching partial save",
+        value=True,
+        help="Continue after the last saved email when a checkpoint exists for this account and these settings."
+    )
 
     submitted = st.form_submit_button("Start Optimized Extraction", use_container_width=True)
 
@@ -162,17 +186,35 @@ if submitted:
             imap_start_date = start_date.strftime("%d-%b-%Y")
             imap_end_date = (end_date + timedelta(days=1)).strftime("%d-%b-%Y")
 
+            partial_filename = partial_save_filename(
+                email_addr, start_date, end_date, fetch_size_kb, char_limit
+            )
+            email_data = []
+            last_saved_uid = 0
+            if resume_partial and os.path.exists(partial_filename):
+                try:
+                    saved_df = pd.read_csv(partial_filename)
+                    if "_IMAP UID" not in saved_df.columns:
+                        st.warning("This partial save has no resume position. Starting a fresh download.")
+                    else:
+                        saved_uids = pd.to_numeric(saved_df["_IMAP UID"], errors="coerce").dropna()
+                        if not saved_uids.empty:
+                            last_saved_uid = int(saved_uids.max())
+                            email_data = saved_df.to_dict("records")
+                            log_container.info(f"Resuming after saved email UID {last_saved_uid}.")
+                except Exception as e:
+                    st.warning(f"Could not read the matching partial save; starting fresh. Detail: {e}")
+
             log_container.info(f"Searching mailbox from {imap_start_date} to {imap_end_date}...")
             
-            status, data = mail.search(None, 'SINCE', imap_start_date, 'BEFORE', imap_end_date)
+            status, data = mail.uid('search', None, 'SINCE', imap_start_date, 'BEFORE', imap_end_date)
             
-            if not data[0]:
+            if not data[0] and not email_data:
                 log_container.warning("No emails found in this date range.")
             else:
-                message_ids = data[0].split()
+                matching_uids = data[0].split() if data[0] else []
+                message_ids = [uid for uid in matching_uids if int(uid) > last_saved_uid]
                 total_emails = len(message_ids)
-                
-                email_data = []
                 start_time = time.time()
                 processed_count = 0
                 last_save_count = 0 # Track partial saves
@@ -183,24 +225,29 @@ if submitted:
                 fetch_size_bytes = int(fetch_size_kb * 1024)
                 
                 # Fetches 100% of the Header, and dynamically limits ONLY the Body to X kilobytes
-                fetch_command = f"(RFC822.SIZE BODY.PEEK[HEADER] BODY.PEEK[TEXT]<0.{fetch_size_bytes}>)"
+                fetch_command = f"(UID RFC822.SIZE BODY.PEEK[HEADER] BODY.PEEK[TEXT]<0.{fetch_size_bytes}>)"
 
-                log_container.info(f"Found {total_emails} emails. Starting partial download ({fetch_size_kb}KB limit per email body)...")
+                log_container.info(f"Found {total_emails} emails to download ({fetch_size_kb}KB limit per email body)...")
 
                 for i in range(0, total_emails, batch_size):
-                    batch_ids = message_ids[i:i+batch_size]
-                    id_str = b",".join(batch_ids)
+                    batch_uids = message_ids[i:i+batch_size]
+                    id_str = b",".join(batch_uids)
                     
-                    status, msg_data = mail.fetch(id_str, fetch_command)
+                    status, msg_data = mail.uid('fetch', id_str, fetch_command)
                     
                     current_header = b""
                     current_body = b""
                     current_size_bytes = 0
+                    current_uid = 0
+                    current_email_date = "Unknown"
                     
                     for response_part in msg_data:
                         # Capture the header block and the body block
                         if isinstance(response_part, tuple):
                             descriptor = response_part[0].upper()
+                            uid_match = re.search(rb'\bUID\s+(\d+)', descriptor)
+                            if uid_match:
+                                current_uid = int(uid_match.group(1))
                             size_match = re.search(rb'RFC822\.SIZE\s+(\d+)', descriptor)
                             if size_match:
                                 current_size_bytes = int(size_match.group(1))
@@ -238,6 +285,7 @@ if submitted:
                                         date_str = dt_local.strftime("%Y-%m-%d %H:%M:%S")
                                     except:
                                         date_str = str(date_header)
+                                current_email_date = date_str or "Unknown"
                                 
                                 # Extract Sender
                                 sender_header = msg.get("From", "")
@@ -253,15 +301,17 @@ if submitted:
                                     "Sender Email": sender_email,
                                     "Email Title": subject,
                                     "Email Content": body_text,
-                                    "Email Size (KB)": current_size_bytes / 1024
+                                    "Email Size (KB)": current_size_bytes / 1024,
+                                    "_IMAP UID": current_uid
                                 })
                                 
                                 # Reset for the next email in the batch
                                 current_header = b""
                                 current_body = b""
                                 current_size_bytes = 0
+                                current_uid = 0
                     
-                    processed_count += len(batch_ids)
+                    processed_count += len(batch_uids)
                     elapsed_time = time.time() - start_time
                     time_per_email = elapsed_time / processed_count
                     remaining_emails = total_emails - processed_count
@@ -273,7 +323,6 @@ if submitted:
                     # --- NEW PARTIAL SAVE LOGIC ---
                     partial_msg = ""
                     if enable_partial_save and (processed_count - last_save_count) >= save_interval:
-                        partial_filename = f"partial_save_{start_date.strftime('%Y%m%d')}_to_{end_date.strftime('%Y%m%d')}.csv"
                         df_partial = pd.DataFrame(email_data)
                         df_partial.to_csv(partial_filename, index=False, encoding='utf-8-sig')
                         last_save_count = processed_count
@@ -281,7 +330,8 @@ if submitted:
 
                     log_container.info(
                         f"⚡ Processed {processed_count} / {total_emails} emails... "
-                        f"(⏳ Est. remaining time: {est_remaining_sec} seconds){partial_msg}"
+                        f"(⏳ Est. remaining time: {est_remaining_sec} seconds | "
+                        f"📅 Current email date: {current_email_date}){partial_msg}"
                     )
 
                 mail.logout()
@@ -289,7 +339,7 @@ if submitted:
                 period_str = f"{start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}"
                 filename = f"Gmail_summary ({period_str}).csv"
 
-                df = pd.DataFrame(email_data)
+                df = pd.DataFrame(email_data).drop(columns=["_IMAP UID"], errors="ignore")
                 csv = df.to_csv(index=False).encode('utf-8-sig')
                 
                 # Save Data and States for Download/Analytics Phase
@@ -303,9 +353,8 @@ if submitted:
 
                 if enable_partial_save:
                     try:
-                        cleanup_files = glob.glob(f"partial_save_{start_date.strftime('%Y%m%d')}_to_{end_date.strftime('%Y%m%d')}.csv")
-                        for f_name in cleanup_files:
-                            os.remove(f_name)
+                        if os.path.exists(partial_filename):
+                            os.remove(partial_filename)
                     except Exception:
                         pass
 
@@ -371,6 +420,7 @@ if st.session_state.get('download_ready', False):
                 .sort_values('Total Emails', ascending=False)
                 .head(top_sender_count)
             )
+            top_senders.insert(0, 'Top', range(1, len(top_senders) + 1))
             top_senders['Total Size (KB)'] = top_senders['Total Size (KB)'].apply(
                 lambda size: f"{size:,.0f}"
             )
