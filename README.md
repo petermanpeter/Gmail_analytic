@@ -1,5 +1,6 @@
 # Gmail_analytic
 Analyze Gmail summary for insight
+https://peter-gmail-analytic.streamlit.app/
 
 # Steps
 1) Install dependencies in your terminal: 
